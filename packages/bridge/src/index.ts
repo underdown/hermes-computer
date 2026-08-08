@@ -197,7 +197,7 @@ export default {
 
     // Health check
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "0.1.0" });
+      return Response.json({ status: "ok", version: "0.1.1" });
     }
 
     // Tool execution endpoints
@@ -206,24 +206,65 @@ export default {
       const body: ToolRequest = await request.json().catch(() => ({}));
       const args = body.args || {};
 
-      // Get or create a workspace for this session
-      const sessionId = request.headers.get("X-Session-Id") || "default";
-      const agentId = env.AgentDO.idFromName(sessionId);
-      const agent = env.AgentDO.get(agentId);
-      const workspace = await agent.__getWorkspaceStub();
-
+      // Route to known tools
       switch (tool) {
-        case "terminal":
-          return handleTerminal(workspace as unknown as Workspace, args);
-        case "read_file":
-          return handleReadFile(workspace as unknown as Workspace, args);
-        case "write_file":
-          return handleWriteFile(workspace as unknown as Workspace, args);
-        case "execute_code":
-          return handleExecuteCode(workspace as unknown as Workspace, args);
+        case "terminal": {
+          const command = String(args.command || "");
+          if (!command) return Response.json({ error: "Missing command" }, { status: 400 });
+          try {
+            const sessionId = request.headers.get("X-Session-Id") || "default";
+            const agentId = env.AgentDO.idFromName(sessionId);
+            const agent = env.AgentDO.get(agentId);
+            const workspace = await agent.__getWorkspaceStub();
+            return handleTerminal(workspace as unknown as Workspace, args);
+          } catch (err: any) {
+            return Response.json({ error: `Workspace unavailable: ${err.message}`, command }, { status: 503 });
+          }
+        }
+        case "read_file": {
+          const path = String(args.path || "");
+          if (!path) return Response.json({ error: "Missing path" }, { status: 400 });
+          try {
+            const sessionId = request.headers.get("X-Session-Id") || "default";
+            const agentId = env.AgentDO.idFromName(sessionId);
+            const agent = env.AgentDO.get(agentId);
+            const workspace = await agent.__getWorkspaceStub();
+            return handleReadFile(workspace as unknown as Workspace, args);
+          } catch (err: any) {
+            return Response.json({ error: `Workspace unavailable: ${err.message}` }, { status: 503 });
+          }
+        }
+        case "write_file": {
+          const path = String(args.path || "");
+          if (!path) return Response.json({ error: "Missing path" }, { status: 400 });
+          try {
+            const sessionId = request.headers.get("X-Session-Id") || "default";
+            const agentId = env.AgentDO.idFromName(sessionId);
+            const agent = env.AgentDO.get(agentId);
+            const workspace = await agent.__getWorkspaceStub();
+            return handleWriteFile(workspace as unknown as Workspace, args);
+          } catch (err: any) {
+            return Response.json({ error: `Workspace unavailable: ${err.message}` }, { status: 503 });
+          }
+        }
+        case "execute_code": {
+          const code = String(args.code || "");
+          if (!code) return Response.json({ error: "Missing code" }, { status: 400 });
+          try {
+            const sessionId = request.headers.get("X-Session-Id") || "default";
+            const agentId = env.AgentDO.idFromName(sessionId);
+            const agent = env.AgentDO.get(agentId);
+            const workspace = await agent.__getWorkspaceStub();
+            return handleExecuteCode(workspace as unknown as Workspace, args);
+          } catch (err: any) {
+            return Response.json({ error: `Workspace unavailable: ${err.message}` }, { status: 503 });
+          }
+        }
         case "browser_navigate":
         case "browser_console":
         case "browser_snapshot":
+        case "browser_click":
+        case "browser_type":
           return Response.json({ error: "Browser tools require Container backend — coming soon" }, { status: 501 });
         default:
           return Response.json({ error: `Unknown tool: ${tool}` }, { status: 404 });

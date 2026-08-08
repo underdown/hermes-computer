@@ -2,8 +2,16 @@
   "name": "hermes-computer",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-07",
-  "compatibility_flags": ["nodejs_compat", "experimental"],
+  "compatibility_flags": ["nodejs_compat"],
   "ai": { "binding": "AI" },
+  "workers_dev": true,
+  "routes": [
+    {
+      "pattern": "computer.arapaholabs.com",
+      "zone_id": "5915acea18763447dc2f01451b6944db",
+      "custom_domain": true
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
