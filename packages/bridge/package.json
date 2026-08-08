@@ -1,0 +1,18 @@
+{
+  "name": "@hermes-computer/bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "@cloudflare/computer": "^0.1.0-alpha.1",
+    "@cloudflare/think": "^0.1.0-alpha.1",
+    "workers-ai-provider": "^0.1.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

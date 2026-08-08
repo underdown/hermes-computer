@@ -1,0 +1,5 @@
+name: hermes-computer
+version: 0.1.0
+description: "Route tool execution to sandboxed Cloudflare Computer workspaces — no untrusted code touches your server."
+author: huxley
+kind: standalone
