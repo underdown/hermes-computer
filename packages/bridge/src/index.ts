@@ -32,6 +32,7 @@ import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 import { WorkerJavaScriptBackend } from "@cloudflare/computer/backends/worker-javascript";
 import { Think } from "@cloudflare/think";
 import { createWorkersAI } from "workers-ai-provider";
+import { dirsToCreate, normalizeExecResult, pickBackend, type Backend } from "./core";
 import { createAITools } from "@cloudflare/computer/tools";
 import { DurableObject } from "cloudflare:workers";
 import type { LanguageModel } from "ai";
@@ -222,19 +223,13 @@ export class AgentDO extends withWorkspaceContainer(AgentBase) {
   // those properties type-checked as "override" against the wrong base but were
   // never read, so getModel() hit its default implementation and threw
   // "Override getModel() to return a LanguageModel" on any real chat turn.
+  //
+  // workers-ai-provider@3.3.1 targets ai@^6, matching this project's ai@6, so
+  // its WorkersAIChatLanguageModel is assignable to Think's LanguageModel with
+  // no cast. It was previously 0.1.3 (ai@^4 / LanguageModelV1), which needed
+  // `as unknown as LanguageModel` and was a genuine runtime mismatch.
   override getModel(): LanguageModel {
-    // TWO deliberate casts, both from a real dependency conflict:
-    //
-    // 1. Model id: validated against the Workers AI catalog type, which has
-    //    "@cf/zai-org/glm-4.7-flash" but not "@cf/zai-org/glm-5.2".
-    // 2. Provider: workers-ai-provider@0.1.3 depends on ai@^4 and returns a
-    //    LanguageModelV1, while this project runs ai@6 and Think expects a
-    //    LanguageModel (V2/V3). The shapes differ (`supportedUrls` is missing).
-    //    Resolving this needs a provider upgrade to 4.x, which is a dependency
-    //    change with its own runtime risk — tracked, not hidden here.
-    return createWorkersAI({ binding: this.env.AI })(
-      "@cf/zai-org/glm-4.7-flash" as any,
-    ) as unknown as LanguageModel;
+    return createWorkersAI({ binding: this.env.AI })("@cf/zai-org/glm-4.7-flash");
   }
 
   // SDK 0.1.x takes a SINGLE options object, not (workspace, options).
@@ -296,7 +291,11 @@ async function resolveWorkspace(
 async function handleTerminal(
   workspace: WorkspaceClient,
   args: Record<string, unknown>,
-  backend: "shell" | "container" = "shell",
+  // Typed as Backend (includes "js"), not "shell" | "container": the route
+  // always accepted "js" but the old signature hid that behind a
+  // `requested as "shell" | "container"` cast, which is why the js path was
+  // never type-checked.
+  backend: Backend = "shell",
 ): Promise<Response> {
   const command = String(args.command || "");
   if (!command) return Response.json({ error: "Missing command" }, { status: 400 });
@@ -316,26 +315,10 @@ async function handleTerminal(
       encoding: "utf8",
     });
     const result = await handle.result();
-    // `value` carries the js backend's module result. Fall back to it so js
-    // calls don't silently report empty output.
-    const value = result?.value;
-    const valueText =
-      value === undefined || value === null
-        ? ""
-        : typeof value === "string"
-          ? value
-          : JSON.stringify(value);
-    const stdout = result?.stdout ?? "";
-    return Response.json({
-      output: stdout || valueText,
-      stdout,
-      value: value ?? null,
-      stderr: result?.stderr ?? "",
-      exitCode: result?.exitCode ?? 0,
-      status: result?.status,
-      backend,
-      actualBackend: (result as any)?.backend ?? handle?.backend ?? null,
-    });
+    // Normalization (stdout-vs-value fallback, Uint8Array coercion, handle
+    // backend fallback) lives in core.ts so it is unit-testable; the three
+    // bugs it guards against are documented there.
+    return Response.json(normalizeExecResult(result, backend, (handle as any)?.backend));
   } catch (err: any) {
     return Response.json({ error: err.message, output: "" }, { status: 500 });
   }
@@ -374,10 +357,9 @@ async function handleWriteFile(
     // The workspace VFS is rooted at "/" and does NOT pre-create /workspace.
     // writeFile refuses to create intermediate directories, so any nested path
     // failed with ENOENT "parent directory missing". Create the parents first
-    // (idempotent: recursive mkdir swallows EEXIST).
-    const parent = path.slice(0, path.lastIndexOf("/"));
-    if (parent && parent !== "/") {
-      await workspace.fs.mkdir(parent, { recursive: true });
+    // (recursive mkdir is idempotent, so EEXIST needs no handling).
+    for (const dir of dirsToCreate(path)) {
+      await workspace.fs.mkdir(dir, { recursive: true });
     }
     await workspace.fs.writeFile(path, content);
     return Response.json({ ok: true, bytes: content.length, path });
@@ -667,11 +649,12 @@ export default {
             // An explicit backend in the request body wins; otherwise ask the
             // Optimizer to pick. Previously selectBackend always overrode it,
             // so "backend":"container" was silently ignored.
-            const requested = typeof args.backend === "string" ? args.backend : "";
-            const backend =
-              requested === "container" || requested === "shell" || requested === "js"
-                ? (requested as "shell" | "container")
-                : await selectBackend(env, command, "terminal");
+            const backend = await pickBackend(
+              args.backend,
+              (cmd, tool) => selectBackend(env, cmd, tool) as Promise<Backend>,
+              command,
+              "terminal",
+            );
             const start = Date.now();
             const response = await handleTerminal(workspace, args, backend);
             traceOutcome(env, command, "terminal", backend, response.ok ? "success" : "failure", Date.now() - start);

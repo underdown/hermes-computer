@@ -4,15 +4,17 @@
   "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "dev": "wrangler dev",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@cloudflare/computer": "^0.1.0-alpha.1",
     "@cloudflare/think": "^0.1.0-alpha.1",
-    "workers-ai-provider": "^0.1.0"
+    "workers-ai-provider": "3.3.1"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "wrangler": "^4.0.0"
   }
 }
