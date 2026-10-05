@@ -10,6 +10,73 @@
 /** Backends the /tools/terminal route accepts. Anything else is ignored. */
 export type Backend = "shell" | "container" | "js";
 
+/** Default when MODEL is unset. */
+export const DEFAULT_WORKERS_AI_MODEL = "@cf/zai-org/glm-4.7-flash";
+
+export type ModelBinding =
+  /** Workers AI catalog id, e.g. "@cf/zai-org/glm-4.7-flash". */
+  | { kind: "workers-ai"; model: string }
+  /**
+   * Any OpenAI-compatible /chat/completions endpoint. Escape hatch for models
+   * Workers AI does not host — notably FrogNano-4B-2609, which has no
+   * first-party endpoint and must be self-hosted (vLLM/SGLang/Ollama) behind a
+   * gateway, then pointed at here.
+   */
+  | { kind: "openai-compatible"; baseURL: string; apiKey: string; model: string };
+
+/**
+ * Resolves the model binding from env, defaulting to the Workers AI catalog.
+ *
+ * MODEL is a plain catalog id. When MODEL is an absolute URL the binding
+ * switches to OpenAI-compatible mode, so a self-hosted endpoint can be adopted
+ * without a code change. MODEL_BASE_URL is the explicit alternative for a
+ * hosted gateway where the model id and the URL are separate values.
+ *
+ * Throws rather than silently falling back: a misconfigured model should fail
+ * loudly at the first chat turn, not look like a bad prompt.
+ */
+export function resolveModelBinding(env: {
+  MODEL?: string;
+  MODEL_BASE_URL?: string;
+  MODEL_API_KEY?: string;
+}): ModelBinding {
+  const raw = env.MODEL?.trim() || DEFAULT_WORKERS_AI_MODEL;
+
+  if (/^https?:\/\//i.test(raw)) {
+    if (!env.MODEL_API_KEY) {
+      throw new Error(
+        "MODEL is a URL (OpenAI-compatible mode) but MODEL_API_KEY is unset. " +
+          "Set it, or set MODEL to a Workers AI catalog id instead.",
+      );
+    }
+    return {
+      kind: "openai-compatible",
+      baseURL: raw.replace(/\/+$/, ""),
+      apiKey: env.MODEL_API_KEY,
+      // A bare-URL binding serves one model; "default" is the convention
+      // gateways use to mean "the only one you have".
+      model: "default",
+    };
+  }
+
+  if (env.MODEL_BASE_URL) {
+    if (!env.MODEL_API_KEY) {
+      throw new Error(
+        "MODEL_BASE_URL is set but MODEL_API_KEY is unset. Both are required " +
+          "for OpenAI-compatible mode.",
+      );
+    }
+    return {
+      kind: "openai-compatible",
+      baseURL: env.MODEL_BASE_URL.replace(/\/+$/, ""),
+      apiKey: env.MODEL_API_KEY,
+      model: raw,
+    };
+  }
+
+  return { kind: "workers-ai", model: raw };
+}
+
 const VALID_BACKENDS: ReadonlySet<string> = new Set<Backend>(["shell", "container", "js"]);
 
 /**

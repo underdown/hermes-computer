@@ -32,7 +32,14 @@ import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 import { WorkerJavaScriptBackend } from "@cloudflare/computer/backends/worker-javascript";
 import { Think } from "@cloudflare/think";
 import { createWorkersAI } from "workers-ai-provider";
-import { dirsToCreate, normalizeExecResult, pickBackend, type Backend } from "./core";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import {
+  dirsToCreate,
+  normalizeExecResult,
+  pickBackend,
+  resolveModelBinding,
+  type Backend,
+} from "./core";
 import { createAITools } from "@cloudflare/computer/tools";
 import { DurableObject } from "cloudflare:workers";
 import type { LanguageModel } from "ai";
@@ -74,6 +81,17 @@ interface Env {
   /** Bearer token for the Tool Optimizer service. Set via `wrangler secret put
    *  OPTIMIZER_TOKEN` -- never committed. */
   OPTIMIZER_TOKEN: string;
+  /**
+   * Model id. A Workers AI catalog id by default; an absolute URL switches the
+   * binding to OpenAI-compatible mode. Optional -- defaults to
+   * DEFAULT_WORKERS_AI_MODEL. Set via `wrangler secret put MODEL` to change
+   * models without a redeploy.
+   */
+  MODEL?: string;
+  /** OpenAI-compatible base URL. Set together with MODEL_API_KEY. */
+  MODEL_BASE_URL?: string;
+  /** Bearer for the OpenAI-compatible endpoint. `wrangler secret put`. */
+  MODEL_API_KEY?: string;
 }
 
 interface ToolRequest {
@@ -229,7 +247,26 @@ export class AgentDO extends withWorkspaceContainer(AgentBase) {
   // no cast. It was previously 0.1.3 (ai@^4 / LanguageModelV1), which needed
   // `as unknown as LanguageModel` and was a genuine runtime mismatch.
   override getModel(): LanguageModel {
-    return createWorkersAI({ binding: this.env.AI })("@cf/zai-org/glm-4.7-flash");
+    // Model id comes from env so the binding is swappable without a code
+    // change. Two shapes, chosen by resolveModelBinding:
+    //   MODEL="@cf/zai-org/glm-4.7-flash"  -> Workers AI catalog
+    //   MODEL="https://host/v1" + key      -> OpenAI-compatible gateway
+    // FrogNano-4B-2609 is NOT reachable through Workers AI (it has no hosted
+    // endpoint at all), so it would use the OpenAI-compatible branch against a
+    // self-hosted vLLM/SGLang server.
+    const binding = resolveModelBinding(this.env);
+
+    if (binding.kind === "openai-compatible") {
+      return createOpenAICompatible({
+        // `name` is required by OpenAICompatibleProviderSettings and shows up
+        // in telemetry/provider metadata. Any stable label works.
+        name: "self-hosted",
+        baseURL: binding.baseURL,
+        apiKey: binding.apiKey,
+      }).chatModel(binding.model);
+    }
+
+    return createWorkersAI({ binding: this.env.AI })(binding.model);
   }
 
   // SDK 0.1.x takes a SINGLE options object, not (workspace, options).

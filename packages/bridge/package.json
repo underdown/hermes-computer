@@ -9,6 +9,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@ai-sdk/openai-compatible": "2.0.81",
     "@cloudflare/computer": "^0.1.0-alpha.1",
     "@cloudflare/think": "^0.1.0-alpha.1",
     "workers-ai-provider": "3.3.1"
