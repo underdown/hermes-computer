@@ -1,0 +1,33 @@
+[Unit]
+Description=Cloudflare tunnel connector for LM Studio (lmstudio.arapaholabs.com)
+Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+After=network-online.target lm-gateway.service
+Wants=network-online.target
+# The connector fronts the proxy; do not start it if the proxy is absent.
+Requires=lm-gateway.service
+
+[Service]
+Type=simple
+# Credential file, not a unit line, so the tunnel token never appears in
+# `systemctl cat` output or in the process table.
+# --no-autoupdate is a global flag and must precede the `tunnel` subcommand,
+# else cloudflared exits 0 with "flag provided but not defined" and systemd
+# restart-loops silently.
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel run --protocol http2 --token-file /home/huxley/.config/lm-gateway/tunnel.token
+Restart=always
+RestartSec=10
+
+# The connector only needs outbound network + its own credential.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/home/huxley/.config/lm-gateway
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

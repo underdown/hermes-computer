@@ -1,0 +1,30 @@
+[Unit]
+Description=Auth-gated reverse proxy to LM Studio (tailnet-only)
+Documentation=file:///home/huxley/projects/hermes-computer/packages/bridge/tools/lm_gateway.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/huxley/.config/lm-gateway/env
+ExecStart=/usr/bin/python3 /home/huxley/projects/hermes-computer/packages/bridge/tools/lm_gateway.py
+Restart=on-failure
+RestartSec=5
+
+# The token lives in an EnvironmentFile; keep it unreadable to other processes
+# and off disk where possible.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/home/huxley/.config/lm-gateway
+PrivateTmp=true
+NoNewPrivileges=true
+# Only needs to read its own source and the credential file.
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
