@@ -21,6 +21,7 @@ import {
   WorkspaceServiceProxy,
   WorkspaceStub,
   type WorkspaceClient,
+  type WorkspaceHandle,
   getWorkspace,
 } from "@cloudflare/computer";
 import {
@@ -33,6 +34,7 @@ import { Think } from "@cloudflare/think";
 import { createWorkersAI } from "workers-ai-provider";
 import { createAITools } from "@cloudflare/computer/tools";
 import { DurableObject } from "cloudflare:workers";
+import type { LanguageModel } from "ai";
 
 export { WorkspaceProxy, WorkspaceServiceProxy };
 
@@ -163,8 +165,11 @@ async function traceOutcome(
 // ── Agent DO (Think + Computer Workspace) ───────────────────────
 
 class AgentBase extends Think<Env> {
-  override workspaceBash = false;
-  override maxSteps = 20;
+  // Think reads step limits through getMaxSteps(); assigning `maxSteps = 20`
+  // created a dead property the base class never reads (the default stayed 10).
+  override getMaxSteps(): number {
+    return 20;
+  }
 }
 
 export class AgentDO extends withWorkspaceContainer(AgentBase) {
@@ -174,7 +179,7 @@ export class AgentDO extends withWorkspaceContainer(AgentBase) {
     workspace: { binding: "AgentDO", id: this.ctx.id.toString() },
   });
 
-  override workspace = new Workspace({
+  workspace = new Workspace({
     storage: this.ctx.storage as unknown as DurableObjectStorageLike,
     backends: [
       new WorkerShellBackend({
@@ -197,7 +202,10 @@ export class AgentDO extends withWorkspaceContainer(AgentBase) {
     waitUntil: this.ctx.waitUntil.bind(this.ctx),
   }) as Workspace & any;
 
-  override async fetch(request: Request): Promise<Response> {
+  // Not an `override`: `fetch` is not declared on Think_base's constructor type,
+  // so the modifier does not apply even though the base does handle fetch at
+  // runtime (super.fetch routes non-/ws requests to onChatMessage).
+  async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/ws") return this.#containerBackend.handleFetch(request);
     return super.fetch(request);
@@ -207,41 +215,79 @@ export class AgentDO extends withWorkspaceContainer(AgentBase) {
   // A raw Workspace is not structured-cloneable, so Workers RPC rejects
   // it with 'Could not serialize object of type "Workspace"'.
   async __getWorkspaceStub(): Promise<WorkspaceStub> {
-    return new WorkspaceStub(this.workspace as unknown as Workspace);
+    return new WorkspaceStub(this.workspace);
   }
 
-  override model = createWorkersAI({ binding: this.env.AI })("@cf/zai-org/glm-5.2");
+  // Think calls getModel()/getTools(), NOT this.model / this.tools. Assigning
+  // those properties type-checked as "override" against the wrong base but were
+  // never read, so getModel() hit its default implementation and threw
+  // "Override getModel() to return a LanguageModel" on any real chat turn.
+  override getModel(): LanguageModel {
+    // TWO deliberate casts, both from a real dependency conflict:
+    //
+    // 1. Model id: validated against the Workers AI catalog type, which has
+    //    "@cf/zai-org/glm-4.7-flash" but not "@cf/zai-org/glm-5.2".
+    // 2. Provider: workers-ai-provider@0.1.3 depends on ai@^4 and returns a
+    //    LanguageModelV1, while this project runs ai@6 and Think expects a
+    //    LanguageModel (V2/V3). The shapes differ (`supportedUrls` is missing).
+    //    Resolving this needs a provider upgrade to 4.x, which is a dependency
+    //    change with its own runtime risk — tracked, not hidden here.
+    return createWorkersAI({ binding: this.env.AI })(
+      "@cf/zai-org/glm-4.7-flash" as any,
+    ) as unknown as LanguageModel;
+  }
 
   // SDK 0.1.x takes a SINGLE options object, not (workspace, options).
   // The old two-arg call left options.workspace undefined and threw
   // "Cannot read properties of undefined (reading 'assets')" in the DO
   // constructor, so every /tools request 503'd.
-  override tools = createAITools({
-    workspace: this.workspace as any,
-    shell: {
-      // A Record keyed by backend id, NOT an array: the SDK derives
-      // defaultBackend from Object.keys(backends), so an array yields
-      // ids "0"/"1"/"2" and the default lookup throws.
-      backends: {
-        js: {
-          description:
-            "Sandboxed JavaScript execution. No network access. Returns structured results, not just stdout. Fast cold start.",
+  override getTools() {
+    return createAITools({
+      workspace: this.workspace as any,
+      shell: {
+        // A Record keyed by backend id, NOT an array: the SDK derives
+        // defaultBackend from Object.keys(backends), so an array yields
+        // ids "0"/"1"/"2" and the default lookup throws.
+        backends: {
+          js: {
+            description:
+              "Sandboxed JavaScript execution. No network access. Returns structured results, not just stdout. Fast cold start.",
+          },
+          shell: { description: "Fast just-bash shell for text tooling" },
+          container: {
+            description:
+              "Full Linux userland (npm, pip, git, python, node, Playwright). Slower cold start.",
+          },
         },
-        shell: { description: "Fast just-bash shell for text tooling" },
-        container: {
-          description:
-            "Full Linux userland (npm, pip, git, python, node, Playwright). Slower cold start.",
-        },
+        defaultBackend: "shell",
       },
-      defaultBackend: "shell",
-    },
-    read: {},
-    write: {},
-    edit: {},
-  }) as any;
+      read: {},
+      write: {},
+      edit: {},
+    }) as any;
+  }
 }
 
 // ── Direct Tool Execution Endpoints ─────────────────────────────
+
+/**
+ * Resolve the Workspace for a session.
+ *
+ * getWorkspace() takes a WorkspaceHandle (an object carrying the SDK's
+ * WORKSPACE brand or a WorkspaceStubHost). A DurableObjectStub for AgentDO
+ * satisfies that at runtime — it exposes __getWorkspaceStub, which returns the
+ * RPC-safe WorkspaceStub — but the brand is not visible to the type checker,
+ * so the cast is confined to this one helper instead of being repeated (and
+ * subtly varied) at every call site.
+ */
+async function resolveWorkspace(
+  env: Env,
+  sessionId: string,
+): Promise<WorkspaceClient> {
+  const agentId = env.AgentDO.idFromName(sessionId);
+  const agent = env.AgentDO.get(agentId);
+  return getWorkspace(agent as unknown as WorkspaceHandle);
+}
 
 /**
  * Execute a shell command in the workspace.
@@ -325,8 +371,16 @@ async function handleWriteFile(
   if (!path) return Response.json({ error: "Missing path" }, { status: 400 });
 
   try {
+    // The workspace VFS is rooted at "/" and does NOT pre-create /workspace.
+    // writeFile refuses to create intermediate directories, so any nested path
+    // failed with ENOENT "parent directory missing". Create the parents first
+    // (idempotent: recursive mkdir swallows EEXIST).
+    const parent = path.slice(0, path.lastIndexOf("/"));
+    if (parent && parent !== "/") {
+      await workspace.fs.mkdir(parent, { recursive: true });
+    }
     await workspace.fs.writeFile(path, content);
-    return Response.json({ ok: true, bytes: content.length });
+    return Response.json({ ok: true, bytes: content.length, path });
   } catch (err: any) {
     return Response.json({ error: err.message }, { status: 500 });
   }
@@ -608,9 +662,7 @@ export default {
           if (!command) return Response.json({ error: "Missing command" }, { status: 400 });
           try {
             const sessionId = request.headers.get("X-Session-Id") || "default";
-            const agentId = env.AgentDO.idFromName(sessionId);
-            const agent = env.AgentDO.get(agentId);
-            const workspace = await getWorkspace(agent);
+            const workspace = await resolveWorkspace(env, sessionId);
 
             // An explicit backend in the request body wins; otherwise ask the
             // Optimizer to pick. Previously selectBackend always overrode it,
@@ -634,11 +686,9 @@ export default {
           if (!path) return Response.json({ error: "Missing path" }, { status: 400 });
           try {
             const sessionId = request.headers.get("X-Session-Id") || "default";
-            const agentId = env.AgentDO.idFromName(sessionId);
-            const agent = env.AgentDO.get(agentId);
-            const workspace = await getWorkspace(agent);
+            const workspace = await resolveWorkspace(env, sessionId);
             const start = Date.now();
-            const response = await handleReadFile(workspace as unknown as Workspace, args);
+            const response = await handleReadFile(workspace, args);
             traceOutcome(env, path, "read_file", "fs", response.ok ? "success" : "failure", Date.now() - start);
             return response;
           } catch (err: any) {
@@ -651,11 +701,9 @@ export default {
           if (!path) return Response.json({ error: "Missing path" }, { status: 400 });
           try {
             const sessionId = request.headers.get("X-Session-Id") || "default";
-            const agentId = env.AgentDO.idFromName(sessionId);
-            const agent = env.AgentDO.get(agentId);
-            const workspace = await getWorkspace(agent);
+            const workspace = await resolveWorkspace(env, sessionId);
             const start = Date.now();
-            const response = await handleWriteFile(workspace as unknown as Workspace, args);
+            const response = await handleWriteFile(workspace, args);
             traceOutcome(env, path, "write_file", "fs", response.ok ? "success" : "failure", Date.now() - start);
             return response;
           } catch (err: any) {
@@ -668,12 +716,10 @@ export default {
           if (!code) return Response.json({ error: "Missing code" }, { status: 400 });
           try {
             const sessionId = request.headers.get("X-Session-Id") || "default";
-            const agentId = env.AgentDO.idFromName(sessionId);
-            const agent = env.AgentDO.get(agentId);
-            const workspace = await getWorkspace(agent);
+            const workspace = await resolveWorkspace(env, sessionId);
 
             const start = Date.now();
-            const response = await handleExecuteCode(workspace as unknown as Workspace, args);
+            const response = await handleExecuteCode(workspace, args);
             traceOutcome(env, code.slice(0, 100), "execute_code", "js", response.ok ? "success" : "failure", Date.now() - start);
             return response;
           } catch (err: any) {
@@ -686,11 +732,9 @@ export default {
           if (!url) return Response.json({ error: "Missing url" }, { status: 400 });
           try {
             const sessionId = request.headers.get("X-Session-Id") || "default";
-            const agentId = env.AgentDO.idFromName(sessionId);
-            const agent = env.AgentDO.get(agentId);
-            const workspace = await getWorkspace(agent);
+            const workspace = await resolveWorkspace(env, sessionId);
             const start = Date.now();
-            const response = await handleBrowserOp(workspace as unknown as Workspace, "navigate", args);
+            const response = await handleBrowserOp(workspace, "navigate", args);
             traceOutcome(env, url, "browser_navigate", "container", response.ok ? "success" : "failure", Date.now() - start);
             return response;
           } catch (err: any) {
@@ -702,11 +746,9 @@ export default {
           const url = args.url ? String(args.url) : undefined;
           try {
             const sessionId = request.headers.get("X-Session-Id") || "default";
-            const agentId = env.AgentDO.idFromName(sessionId);
-            const agent = env.AgentDO.get(agentId);
-            const workspace = await getWorkspace(agent);
+            const workspace = await resolveWorkspace(env, sessionId);
             const start = Date.now();
-            const response = await handleBrowserOp(workspace as unknown as Workspace, "console", args);
+            const response = await handleBrowserOp(workspace, "console", args);
             traceOutcome(env, url || "(no url)", "browser_console", "container", response.ok ? "success" : "failure", Date.now() - start);
             return response;
           } catch (err: any) {
@@ -718,11 +760,9 @@ export default {
           const url = args.url ? String(args.url) : undefined;
           try {
             const sessionId = request.headers.get("X-Session-Id") || "default";
-            const agentId = env.AgentDO.idFromName(sessionId);
-            const agent = env.AgentDO.get(agentId);
-            const workspace = await getWorkspace(agent);
+            const workspace = await resolveWorkspace(env, sessionId);
             const start = Date.now();
-            const response = await handleBrowserOp(workspace as unknown as Workspace, "snapshot", args);
+            const response = await handleBrowserOp(workspace, "snapshot", args);
             traceOutcome(env, url || "(no url)", "browser_snapshot", "container", response.ok ? "success" : "failure", Date.now() - start);
             return response;
           } catch (err: any) {
@@ -735,11 +775,9 @@ export default {
           if (!selector) return Response.json({ error: "Missing selector" }, { status: 400 });
           try {
             const sessionId = request.headers.get("X-Session-Id") || "default";
-            const agentId = env.AgentDO.idFromName(sessionId);
-            const agent = env.AgentDO.get(agentId);
-            const workspace = await getWorkspace(agent);
+            const workspace = await resolveWorkspace(env, sessionId);
             const start = Date.now();
-            const response = await handleBrowserOp(workspace as unknown as Workspace, "click", args);
+            const response = await handleBrowserOp(workspace, "click", args);
             traceOutcome(env, selector, "browser_click", "container", response.ok ? "success" : "failure", Date.now() - start);
             return response;
           } catch (err: any) {
@@ -752,11 +790,9 @@ export default {
           if (!selector) return Response.json({ error: "Missing selector" }, { status: 400 });
           try {
             const sessionId = request.headers.get("X-Session-Id") || "default";
-            const agentId = env.AgentDO.idFromName(sessionId);
-            const agent = env.AgentDO.get(agentId);
-            const workspace = await getWorkspace(agent);
+            const workspace = await resolveWorkspace(env, sessionId);
             const start = Date.now();
-            const response = await handleBrowserOp(workspace as unknown as Workspace, "type", args);
+            const response = await handleBrowserOp(workspace, "type", args);
             traceOutcome(env, selector, "browser_type", "container", response.ok ? "success" : "failure", Date.now() - start);
             return response;
           } catch (err: any) {
