@@ -255,6 +255,10 @@ async function handleTerminal(
   const command = String(args.command || "");
   if (!command) return Response.json({ error: "Missing command" }, { status: 400 });
 
+  // The "js" backend is a Worker isolate running an ES MODULE, not a shell.
+  // runtime.exec() still takes the code as `source`, but the module's result
+  // arrives in result.value — stdout is legitimately empty, so reading only
+  // stdout made every js call look like it did nothing.
   try {
     // exec() resolves to a HANDLE, not the output. The actual
     // {stdout, stderr, exitCode} only exists on handle.result(). Reading
@@ -266,8 +270,20 @@ async function handleTerminal(
       encoding: "utf8",
     });
     const result = await handle.result();
+    // `value` carries the js backend's module result. Fall back to it so js
+    // calls don't silently report empty output.
+    const value = result?.value;
+    const valueText =
+      value === undefined || value === null
+        ? ""
+        : typeof value === "string"
+          ? value
+          : JSON.stringify(value);
+    const stdout = result?.stdout ?? "";
     return Response.json({
-      output: result?.stdout ?? "",
+      output: stdout || valueText,
+      stdout,
+      value: value ?? null,
       stderr: result?.stderr ?? "",
       exitCode: result?.exitCode ?? 0,
       status: result?.status,
