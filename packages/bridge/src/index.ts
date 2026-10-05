@@ -19,7 +19,9 @@ import {
   Workspace,
   WorkspaceProxy,
   WorkspaceServiceProxy,
-  type WorkspaceStub,
+  WorkspaceStub,
+  type WorkspaceClient,
+  getWorkspace,
 } from "@cloudflare/computer";
 import {
   CloudflareContainerBackend,
@@ -188,6 +190,11 @@ export class AgentDO extends withWorkspaceContainer(AgentBase) {
       this.#containerBackend,
     ],
     useThink: true,
+    // Required: WorkerJavaScriptBackend declares protocol="module", and the
+    // Workspace constructor refuses to build without a waitUntil to keep
+    // in-flight module calls alive past the response. Without this every
+    // /tools call 503s with "Workspace module backend requires waitUntil".
+    waitUntil: this.ctx.waitUntil.bind(this.ctx),
   }) as Workspace & any;
 
   override async fetch(request: Request): Promise<Response> {
@@ -196,33 +203,41 @@ export class AgentDO extends withWorkspaceContainer(AgentBase) {
     return super.fetch(request);
   }
 
+  // Must return the SDK's RPC-safe WorkspaceStub, not the raw Workspace.
+  // A raw Workspace is not structured-cloneable, so Workers RPC rejects
+  // it with 'Could not serialize object of type "Workspace"'.
   async __getWorkspaceStub(): Promise<WorkspaceStub> {
-    return this.workspace as unknown as WorkspaceStub;
+    return new WorkspaceStub(this.workspace as unknown as Workspace);
   }
 
   override model = createWorkersAI({ binding: this.env.AI })("@cf/zai-org/glm-5.2");
 
-  override tools = createAITools(this.workspace as any, {
-    exec: {
-      backends: [
-        {
-          id: "js",
+  // SDK 0.1.x takes a SINGLE options object, not (workspace, options).
+  // The old two-arg call left options.workspace undefined and threw
+  // "Cannot read properties of undefined (reading 'assets')" in the DO
+  // constructor, so every /tools request 503'd.
+  override tools = createAITools({
+    workspace: this.workspace as any,
+    shell: {
+      // A Record keyed by backend id, NOT an array: the SDK derives
+      // defaultBackend from Object.keys(backends), so an array yields
+      // ids "0"/"1"/"2" and the default lookup throws.
+      backends: {
+        js: {
           description:
             "Sandboxed JavaScript execution. No network access. Returns structured results, not just stdout. Fast cold start.",
         },
-        { id: "shell", description: "Fast just-bash shell for text tooling" },
-        {
-          id: "container",
+        shell: { description: "Fast just-bash shell for text tooling" },
+        container: {
           description:
             "Full Linux userland (npm, pip, git, python, node, Playwright). Slower cold start.",
         },
-      ],
+      },
       defaultBackend: "shell",
     },
-    read: true,
-    write: true,
-    edit: true,
-    ls: true,
+    read: {},
+    write: {},
+    edit: {},
   }) as any;
 }
 
@@ -233,7 +248,7 @@ export class AgentDO extends withWorkspaceContainer(AgentBase) {
  * Uses the shell backend by default, container for heavy ops.
  */
 async function handleTerminal(
-  workspace: Workspace,
+  workspace: WorkspaceClient,
   args: Record<string, unknown>,
   backend: "shell" | "container" = "shell",
 ): Promise<Response> {
@@ -241,10 +256,24 @@ async function handleTerminal(
   if (!command) return Response.json({ error: "Missing command" }, { status: 400 });
 
   try {
-    const result = await (workspace.runtime as any).exec(command, {
+    // exec() resolves to a HANDLE, not the output. The actual
+    // {stdout, stderr, exitCode} only exists on handle.result(). Reading
+    // .stdout off the handle yields an empty object. encoding:"utf8" is
+    // required or stdout/stderr come back as Uint8Array and serialize as
+    // {"0":72,"1":69,...} instead of text.
+    const handle = await (workspace.runtime as any).exec(command, {
       backend,
+      encoding: "utf8",
     });
-    return Response.json({ output: result.stdout || result, exitCode: result.exitCode ?? 0 });
+    const result = await handle.result();
+    return Response.json({
+      output: result?.stdout ?? "",
+      stderr: result?.stderr ?? "",
+      exitCode: result?.exitCode ?? 0,
+      status: result?.status,
+      backend,
+      actualBackend: (result as any)?.backend ?? handle?.backend ?? null,
+    });
   } catch (err: any) {
     return Response.json({ error: err.message, output: "" }, { status: 500 });
   }
@@ -254,7 +283,7 @@ async function handleTerminal(
  * Read a file from the workspace filesystem.
  */
 async function handleReadFile(
-  workspace: Workspace,
+  workspace: WorkspaceClient,
   args: Record<string, unknown>
 ): Promise<Response> {
   const path = String(args.path || "");
@@ -272,7 +301,7 @@ async function handleReadFile(
  * Write content to a file in the workspace.
  */
 async function handleWriteFile(
-  workspace: Workspace,
+  workspace: WorkspaceClient,
   args: Record<string, unknown>
 ): Promise<Response> {
   const path = String(args.path || "");
@@ -292,7 +321,7 @@ async function handleWriteFile(
  * Safe, sandboxed, no network access. Returns structured output.
  */
 async function handleExecuteCode(
-  workspace: Workspace,
+  workspace: WorkspaceClient,
   args: Record<string, unknown>,
 ): Promise<Response> {
   const code = String(args.code || "");
@@ -474,7 +503,7 @@ function parseBrowserResult(stdout: string): Record<string, unknown> {
  * Handles cold start, timeouts, and error extraction.
  */
 async function handleBrowserOp(
-  workspace: Workspace,
+  workspace: WorkspaceClient,
   op: "navigate" | "console" | "snapshot" | "click" | "type",
   args: Record<string, unknown>,
 ): Promise<Response> {
@@ -565,11 +594,18 @@ export default {
             const sessionId = request.headers.get("X-Session-Id") || "default";
             const agentId = env.AgentDO.idFromName(sessionId);
             const agent = env.AgentDO.get(agentId);
-            const workspace = await agent.__getWorkspaceStub();
+            const workspace = await getWorkspace(agent);
 
-            const backend = await selectBackend(env, command, "terminal");
+            // An explicit backend in the request body wins; otherwise ask the
+            // Optimizer to pick. Previously selectBackend always overrode it,
+            // so "backend":"container" was silently ignored.
+            const requested = typeof args.backend === "string" ? args.backend : "";
+            const backend =
+              requested === "container" || requested === "shell" || requested === "js"
+                ? (requested as "shell" | "container")
+                : await selectBackend(env, command, "terminal");
             const start = Date.now();
-            const response = await handleTerminal(workspace as unknown as Workspace, args, backend);
+            const response = await handleTerminal(workspace, args, backend);
             traceOutcome(env, command, "terminal", backend, response.ok ? "success" : "failure", Date.now() - start);
             return response;
           } catch (err: any) {
@@ -584,7 +620,7 @@ export default {
             const sessionId = request.headers.get("X-Session-Id") || "default";
             const agentId = env.AgentDO.idFromName(sessionId);
             const agent = env.AgentDO.get(agentId);
-            const workspace = await agent.__getWorkspaceStub();
+            const workspace = await getWorkspace(agent);
             const start = Date.now();
             const response = await handleReadFile(workspace as unknown as Workspace, args);
             traceOutcome(env, path, "read_file", "fs", response.ok ? "success" : "failure", Date.now() - start);
@@ -601,7 +637,7 @@ export default {
             const sessionId = request.headers.get("X-Session-Id") || "default";
             const agentId = env.AgentDO.idFromName(sessionId);
             const agent = env.AgentDO.get(agentId);
-            const workspace = await agent.__getWorkspaceStub();
+            const workspace = await getWorkspace(agent);
             const start = Date.now();
             const response = await handleWriteFile(workspace as unknown as Workspace, args);
             traceOutcome(env, path, "write_file", "fs", response.ok ? "success" : "failure", Date.now() - start);
@@ -618,7 +654,7 @@ export default {
             const sessionId = request.headers.get("X-Session-Id") || "default";
             const agentId = env.AgentDO.idFromName(sessionId);
             const agent = env.AgentDO.get(agentId);
-            const workspace = await agent.__getWorkspaceStub();
+            const workspace = await getWorkspace(agent);
 
             const start = Date.now();
             const response = await handleExecuteCode(workspace as unknown as Workspace, args);
@@ -636,7 +672,7 @@ export default {
             const sessionId = request.headers.get("X-Session-Id") || "default";
             const agentId = env.AgentDO.idFromName(sessionId);
             const agent = env.AgentDO.get(agentId);
-            const workspace = await agent.__getWorkspaceStub();
+            const workspace = await getWorkspace(agent);
             const start = Date.now();
             const response = await handleBrowserOp(workspace as unknown as Workspace, "navigate", args);
             traceOutcome(env, url, "browser_navigate", "container", response.ok ? "success" : "failure", Date.now() - start);
@@ -652,7 +688,7 @@ export default {
             const sessionId = request.headers.get("X-Session-Id") || "default";
             const agentId = env.AgentDO.idFromName(sessionId);
             const agent = env.AgentDO.get(agentId);
-            const workspace = await agent.__getWorkspaceStub();
+            const workspace = await getWorkspace(agent);
             const start = Date.now();
             const response = await handleBrowserOp(workspace as unknown as Workspace, "console", args);
             traceOutcome(env, url || "(no url)", "browser_console", "container", response.ok ? "success" : "failure", Date.now() - start);
@@ -668,7 +704,7 @@ export default {
             const sessionId = request.headers.get("X-Session-Id") || "default";
             const agentId = env.AgentDO.idFromName(sessionId);
             const agent = env.AgentDO.get(agentId);
-            const workspace = await agent.__getWorkspaceStub();
+            const workspace = await getWorkspace(agent);
             const start = Date.now();
             const response = await handleBrowserOp(workspace as unknown as Workspace, "snapshot", args);
             traceOutcome(env, url || "(no url)", "browser_snapshot", "container", response.ok ? "success" : "failure", Date.now() - start);
@@ -685,7 +721,7 @@ export default {
             const sessionId = request.headers.get("X-Session-Id") || "default";
             const agentId = env.AgentDO.idFromName(sessionId);
             const agent = env.AgentDO.get(agentId);
-            const workspace = await agent.__getWorkspaceStub();
+            const workspace = await getWorkspace(agent);
             const start = Date.now();
             const response = await handleBrowserOp(workspace as unknown as Workspace, "click", args);
             traceOutcome(env, selector, "browser_click", "container", response.ok ? "success" : "failure", Date.now() - start);
@@ -702,7 +738,7 @@ export default {
             const sessionId = request.headers.get("X-Session-Id") || "default";
             const agentId = env.AgentDO.idFromName(sessionId);
             const agent = env.AgentDO.get(agentId);
-            const workspace = await agent.__getWorkspaceStub();
+            const workspace = await getWorkspace(agent);
             const start = Date.now();
             const response = await handleBrowserOp(workspace as unknown as Workspace, "type", args);
             traceOutcome(env, selector, "browser_type", "container", response.ok ? "success" : "failure", Date.now() - start);

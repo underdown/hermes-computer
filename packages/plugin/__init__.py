@@ -7,7 +7,7 @@ terminal → Container backend, execute_code → Isolate JS, file tools → DOFS
 import os, json, urllib.request, threading, logging
 
 logger = logging.getLogger("hermes-computer")
-BRIDGE_URL = os.environ.get("HERMES_COMPUTER_URL", "https://hermes-computer.ryanunderdown.workers.dev")
+BRIDGE_URL = os.environ.get("HERMES_COMPUTER_URL", "")
 SESSION_ID = os.environ.get("HERMES_COMPUTER_SESSION", "default")
 
 def _post(path, args):
